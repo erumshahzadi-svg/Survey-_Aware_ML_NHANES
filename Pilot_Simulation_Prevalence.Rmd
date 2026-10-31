@@ -1,0 +1,340 @@
+---
+title: "Pilot simulation by prevalence - survey-weighted and class-weighted logistic training"
+author: "Erum Shahzadi"
+date: "October 2026"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+  word_document:
+    toc: true
+params:
+  reps: 100
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 6.5)
+```
+
+# What this file does
+
+This pilot asks one question under a stratified two-stage cluster survey design:
+
+> When the outcome is rare (**3%, 4% and 5%**), what does a **class weight** $\lambda$ do to sensitivity, false-positive rate (FPR) and calibration, compared with a **survey-weighted model plus a tuned threshold**?
+
+The complete simulation (Steps 1 to 7) is run **once for each prevalence**, and the results are collected in comparison tables by prevalence, $\lambda$ and method.
+
+We build a **finite population** of 200,000 people where we know every outcome. Then we repeatedly draw survey samples, fit three kinds of model, and compare each fitted model with the **true** population values.
+
+| Method | What it is |
+|---|---|
+| **A** | unweighted logistic regression |
+| **B** | survey-weighted logistic regression (weights $w_i$) |
+| **C($\lambda$)** | survey- and class-weighted: weight $w_i\,\lambda^{Y_i}$, so each positive case counts $\lambda$ times more |
+
+The number of replicates is set in the header (`params: reps`). The default is 100 (about 2.5 minutes per prevalence, so about 8 minutes in total). Use 200 or more for the final numbers. The prevalences are set in `PREVS` in Step 0.
+
+# Step 0. Settings
+
+```{r step0}
+H <- 50; J <- 40; M <- 100        # 50 strata, 40 PSUs per stratum, 100 people per PSU
+P <- 5                            # number of predictors
+DRAWS <- 2; PER <- 20             # per stratum: 2 PSU draws, 20 people per draw -> n = 2000
+LAMBDAS <- c(1, 2, 5, 10, 20)     # class weights (lambda = 1 is Method B)
+ALPHA <- 0.05                     # FPR limit used to tune the threshold
+PREVS <- c(0.03, 0.04, 0.05)      # population prevalences to simulate
+TARGET_AUC <- 0.75                # signal strength (AUROC of the true probabilities)
+BASE <- c(1, 0.6, 0.4, 0.2, 0)    # relative size of the 5 true coefficients
+SEED <- 2026
+
+# AUROC from ranks (Mann-Whitney); avoids needing extra packages
+auc <- function(y, p) {
+  r <- rank(p); n1 <- sum(y == 1); n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+```
+
+Everything else reads these numbers. Try changing `PREVS`, `PER` or `LAMBDAS`, then knit again.
+
+# Step 1. Build the finite population (the "truth")
+
+The function takes the prevalence as an argument. Here we build the 3% population to look inside it; Step 6 builds one population per prevalence. The population has 5 predictors, a **PSU random effect** (people in the same PSU share an outcome tendency, which creates clustering), and a binary outcome. The intercept is solved so that prevalence equals `prev`, and the coefficient scale is solved so that the **true** probabilities have AUROC 0.75.
+
+```{r step1}
+make_population <- function(prev, seed = SEED) {
+  set.seed(seed)
+  n_psu <- H * J; N <- n_psu * M
+  psu   <- rep(seq_len(n_psu), each = M)            # PSU label of each person
+  delta <- rnorm(n_psu, 0, 0.3)                     # PSU shift in x1 (clustering in predictors)
+  u     <- rnorm(n_psu, 0, 0.5)                     # PSU random effect in the outcome
+  X <- matrix(rnorm(N * P), N, P)
+  X[, 2] <- 0.4 * X[, 1] + sqrt(1 - 0.16) * X[, 2]  # mild correlation x1-x2
+  X[, 1] <- X[, 1] + delta[psu]
+  v <- runif(N)                                     # fixed uniforms -> fixed outcomes
+  eta <- function(s) as.vector(X %*% (s * BASE)) + u[psu]
+  solve_b0 <- function(e) uniroot(function(b) mean(plogis(b + e)) - prev, c(-20, 5))$root
+  auc_gap <- function(s) {
+    e <- eta(s); p <- plogis(solve_b0(e) + e); auc(as.integer(v < p), p) - TARGET_AUC
+  }
+  s  <- uniroot(auc_gap, c(0.2, 3), tol = 1e-3)$root
+  e  <- eta(s); b0 <- solve_b0(e); p_true <- plogis(b0 + e)
+  y  <- as.integer(v < p_true)                      # the population outcome
+  # size measure per PSU: bigger when mean x1 is bigger -> selection depends on a predictor
+  size <- exp(0.8 * colMeans(matrix(X[, 1], nrow = M)) + 0.3 * rnorm(n_psu))
+  list(X = X, y = y, size = size, auc_true = auc(y, p_true))
+}
+
+pop <- make_population(0.03)          # prevalence 3% for the step-by-step demo
+cat(sprintf("N = %d people | prevalence = %.4f | AUROC of the true probabilities = %.3f\n",
+            nrow(pop$X), mean(pop$y), pop$auc_true))
+```
+
+# Step 2. Draw one survey sample
+
+In each stratum we draw 2 PSUs with probability proportional to a size measure (with replacement), then 20 people by simple random sampling inside each draw. A sampled person's **weight** is 1 divided by the probability of being selected: $1/(2\,p_{PSU}\cdot 20/100)$.
+
+```{r step2}
+draw_sample <- function(pop) {
+  idx <- vector("list", H * DRAWS); w <- vector("list", H * DRAWS); k <- 0
+  for (h in seq_len(H)) {
+    js <- ((h - 1) * J + 1):(h * J)                   # PSUs of stratum h
+    pr <- pop$size[js] / sum(pop$size[js])            # draw probabilities
+    for (d in sample.int(J, DRAWS, replace = TRUE, prob = pr)) {
+      k <- k + 1
+      idx[[k]] <- (js[d] - 1) * M + sample.int(M, PER)   # rows of the 20 sampled people
+      w[[k]]   <- rep(1 / (DRAWS * pr[d] * PER / M), PER)
+    }
+  }
+  list(idx = unlist(idx), w = unlist(w))
+}
+
+set.seed(1)
+smp <- draw_sample(pop)
+ys  <- pop$y[smp$idx]
+cat("Sample size n:", length(smp$idx), "\n")
+cat("Positives in the sample:", sum(ys), "\n")
+cat("Weights: min =", round(min(smp$w), 1), " max =", round(max(smp$w), 1),
+    " CV =", round(sd(smp$w) / mean(smp$w), 2), "\n")
+cat("Kish effective sample size:", round(sum(smp$w)^2 / sum(smp$w^2)), "\n")
+```
+
+The **weight CV** tells you how unequal the weights are, and the **effective sample size** tells you how much information is lost because of them.
+
+# Step 3. Fit the models
+
+* **A**: weights all equal to 1.
+* **B**: survey weights, rescaled to mean 1.
+* **C($\lambda$)**: survey weight times $\lambda$ for positive cases.
+
+```{r step3}
+fit_logit <- function(X, y, sw) {
+  f <- glm.fit(cbind(1, X), y, weights = sw, family = quasibinomial())
+  list(b0 = f$coefficients[1], b = f$coefficients[-1], converged = f$converged)
+}
+predict_prob <- function(fit, X) plogis(fit$b0 + as.vector(X %*% fit$b))
+
+Xs <- pop$X[smp$idx, ]
+wn <- smp$w / mean(smp$w)                              # rescale weights to mean 1
+fitA <- fit_logit(Xs, ys, rep(1, length(ys)))
+fitB <- fit_logit(Xs, ys, wn)
+fitC <- fit_logit(Xs, ys, wn * ifelse(ys == 1, 10, 1))   # lambda = 10
+round(rbind(A = c(fitA$b0, fitA$b), B = c(fitB$b0, fitB$b), `C(10)` = c(fitC$b0, fitC$b)), 2)
+```
+
+The columns are the intercept and the five slopes. Compare the **intercepts** of B and C(10), and then the **slopes**. The intercept should move a lot with $\lambda$ and the slopes much less. That is the idea behind the equivalence of $\lambda$ and thresholding.
+
+# Step 4. Helper functions for evaluation
+
+**Calibration** regresses the true outcome on the logit of the predicted probability. Perfect calibration has intercept 0 and slope 1.
+
+**Tuned threshold** is the smallest cut-off for which the *weighted* FPR among sampled negatives is at most `ALPHA`. A person is predicted positive if the score exceeds it. This is what a real analyst could do with sample data.
+
+```{r step4}
+calib <- function(y, p) {
+  z <- qlogis(pmin(pmax(p, 1e-12), 1 - 1e-12)); A <- cbind(1, z); b <- c(0, 0)
+  for (i in 1:30) {                                   # Newton-Raphson (IRLS)
+    mu <- plogis(drop(A %*% b)); W <- mu * (1 - mu)
+    step <- drop(solve(crossprod(A, A * W), crossprod(A, y - mu))); b <- b + step
+    if (max(abs(step)) < 1e-9) break
+  }
+  b
+}
+
+tuned_threshold <- function(score, y, w) {
+  sn <- score[y == 0]; wn <- w[y == 0]; o <- order(sn)
+  cw <- cumsum(wn[o]) / sum(wn)
+  sn[o][which(cw >= 1 - ALPHA)[1]]
+}
+```
+
+# Step 5. Evaluate a fitted model against the population truth
+
+We apply each fitted model to **all 200,000 people**, so every number below is a **true** population value, not a sample estimate.
+
+```{r step5}
+evaluate <- function(fit, pop, smp, ys, nm, lam) {
+  p <- predict_prob(fit, pop$X); y <- pop$y; pos <- y == 1; neg <- !pos
+  a_b  <- unname(calib(y, p))
+  t_or <- quantile(p[neg], 1 - ALPHA)                 # oracle threshold: FPR = 5% exactly
+  t_tu <- tuned_threshold(p[smp$idx], ys, smp$w)      # threshold chosen from the sample
+  data.frame(method = nm, lam = lam, nonconv = as.integer(!fit$converged),
+             sens_t05 = mean(p[pos] >= 0.5), fpr_t05 = mean(p[neg] >= 0.5),
+             auc = auc(y, p), calib_int = a_b[1], calib_slope = a_b[2],
+             sens_oracle = mean(p[pos] > t_or),
+             sens_tuned = mean(p[pos] > t_tu), fpr_tuned = mean(p[neg] > t_tu))
+}
+
+one_replicate <- function(pop, rep_id, smp = NULL) {
+  if (is.null(smp)) smp <- draw_sample(pop)
+  Xs <- pop$X[smp$idx, ]; ys <- pop$y[smp$idx]
+  wn <- smp$w / mean(smp$w)
+  out <- list(evaluate(fit_logit(Xs, ys, rep(1, length(ys))), pop, smp, ys, "A", NA))
+  for (l in LAMBDAS) {
+    sw <- wn * ifelse(ys == 1, l, 1)                  # survey weight x class weight
+    out[[length(out) + 1]] <- evaluate(fit_logit(Xs, ys, sw), pop, smp, ys,
+                                       ifelse(l == 1, "B", paste0("C", l)), l)
+  }
+  res <- do.call(rbind, out); res$rep <- rep_id
+  diag <- data.frame(rep = rep_id, n_pos = sum(ys), weight_cv = sd(smp$w) / mean(smp$w),
+                     kish_ess = sum(smp$w)^2 / sum(smp$w^2))
+  list(res = res, diag = diag)
+}
+
+demo <- one_replicate(pop, 1, smp)       # the sample drawn in Step 2
+tab <- demo$res[, c("method", "sens_t05", "fpr_t05", "calib_int", "calib_slope", "sens_tuned", "fpr_tuned")]
+knitr::kable(tab, digits = 3, row.names = FALSE,
+             caption = "True population performance of each model, one sample")
+```
+
+Columns: `sens_t05` and `fpr_t05` are sensitivity and FPR at the fixed threshold 0.5; `calib_int` and `calib_slope` are the calibration intercept and slope; `sens_tuned` and `fpr_tuned` are sensitivity and FPR with the sample-tuned threshold.
+
+# Step 6. Run the complete simulation for each prevalence
+
+For each prevalence we build a new population (Step 1) and repeat Steps 2 to 5 `params$reps` times. The spread across replicates gives the **Monte Carlo standard error (MC SE)**.
+
+```{r step6}
+run_scenario <- function(prev, reps) {
+  pop <- make_population(prev)
+  set.seed(SEED + round(prev * 1000))
+  all <- vector("list", reps); dg <- vector("list", reps)
+  for (r in seq_len(reps)) { o <- one_replicate(pop, r); all[[r]] <- o$res; dg[[r]] <- o$diag }
+  df <- do.call(rbind, all); dd <- do.call(rbind, dg)
+  df$prevalence <- prev; dd$prevalence <- prev; dd$pop_prev <- mean(pop$y)
+  list(df = df, dd = dd)
+}
+runs <- lapply(PREVS, function(p) run_scenario(p, params$reps))
+df <- do.call(rbind, lapply(runs, `[[`, "df"))
+dd <- do.call(rbind, lapply(runs, `[[`, "dd"))
+df$method <- factor(df$method, levels = c("A", "B", "C2", "C5", "C10", "C20"))
+reps <- params$reps; R <- reps
+
+design <- do.call(rbind, lapply(split(dd, dd$prevalence), function(d) data.frame(
+  Prevalence = sprintf("%.0f%%", 100 * d$prevalence[1]), `Population prevalence` = round(d$pop_prev[1], 4),
+  `Positives per sample` = round(mean(d$n_pos), 1), `Weight CV` = round(mean(d$weight_cv), 2),
+  `Effective sample size` = round(mean(d$kish_ess)), check.names = FALSE)))
+knitr::kable(design, row.names = FALSE, caption = paste0("Design diagnostics (", reps, " replicates per prevalence)"))
+cat("Non-converged fits:", sum(df$nonconv), "\n")
+```
+
+# Step 7. Comparison tables (prevalence x lambda x model)
+
+Methods: **A** unweighted; **B** survey-weighted ($\lambda = 1$); **C2, C5, C10, C20** survey- and class-weighted with $\lambda = 2, 5, 10, 20$. All numbers are **true population values** averaged over replicates.
+
+```{r tables}
+cols <- c("sens_t05", "fpr_t05", "calib_int", "calib_slope", "sens_tuned", "fpr_tuned", "auc")
+agg  <- aggregate(df[cols], by = list(prevalence = df$prevalence, method = df$method), FUN = mean)
+se   <- aggregate(df[cols], by = list(prevalence = df$prevalence, method = df$method), FUN = function(x) sd(x) / sqrt(length(x)))
+agg  <- agg[order(agg$prevalence, agg$method), ]; se <- se[order(se$prevalence, se$method), ]
+lam_of <- c(A = NA, B = 1, C2 = 2, C5 = 5, C10 = 10, C20 = 20)
+full <- data.frame(Prevalence = sprintf("%.0f%%", 100 * agg$prevalence), Method = as.character(agg$method),
+                   Lambda = lam_of[as.character(agg$method)],
+                   `Sens @0.5` = agg$sens_t05, `FPR @0.5` = agg$fpr_t05,
+                   `Calib. intercept` = agg$calib_int, `Calib. slope` = agg$calib_slope,
+                   `Sens (tuned t)` = agg$sens_tuned, `FPR (tuned t)` = agg$fpr_tuned, AUROC = agg$auc,
+                   check.names = FALSE)
+write.csv(full, "comparison_table_by_prevalence.csv", row.names = FALSE)
+knitr::kable(full, digits = 3, row.names = FALSE,
+             caption = "Table 1. Full comparison: prevalence x method (lambda)")
+cat(sprintf("Largest Monte Carlo SE in Table 1: sensitivity at 0.5 = %.4f, calibration intercept = %.4f, sensitivity with tuned threshold = %.4f\n",
+            max(se$sens_t05), max(se$calib_int), max(se$sens_tuned)))
+```
+
+Compact versions of the main results, with methods in rows and prevalences in columns:
+
+```{r wide}
+wide <- function(col) {
+  m <- tapply(df[[col]], list(Method = df$method, Prevalence = df$prevalence), mean)
+  colnames(m) <- sprintf("%.0f%%", 100 * as.numeric(colnames(m))); m
+}
+knitr::kable(wide("sens_t05"), digits = 3, caption = "Table 2. True sensitivity at threshold 0.5")
+knitr::kable(wide("fpr_t05"), digits = 3, caption = "Table 3. True false-positive rate at threshold 0.5")
+knitr::kable(wide("calib_int"), digits = 2, caption = "Table 4. Calibration intercept (0 is perfect)")
+knitr::kable(wide("sens_tuned"), digits = 3, caption = "Table 5. True sensitivity with a threshold tuned to weighted FPR <= 5%")
+knitr::kable(wide("fpr_tuned"), digits = 3, caption = "Table 6. True FPR achieved with the tuned threshold (target 0.05)")
+```
+
+# Step 8. Figure
+
+```{r step8, fig.height = 7}
+ord <- c("B", "C2", "C5", "C10", "C20"); lam <- c(1, 2, 5, 10, 20)
+cl <- c("#0072B2", "#D55E00", "#009E73"); pv <- sort(unique(df$prevalence))
+line_panel <- function(col, main, ylab, ylim = NULL) {
+  M_ <- sapply(pv, function(p) sapply(ord, function(m) { x <- df[[col]][df$method == m & df$prevalence == p]; c(mean(x), 1.96 * sd(x) / sqrt(length(x))) }))
+  mu <- M_[seq(1, nrow(M_), 2), ]; hw <- M_[seq(2, nrow(M_), 2), ]
+  if (is.null(ylim)) ylim <- range(c(mu - hw, mu + hw))
+  plot(NA, xlim = range(lam), ylim = ylim, log = "x", xaxt = "n", xlab = "class weight lambda", ylab = ylab, main = main, cex.main = 0.9)
+  axis(1, at = lam, labels = lam); grid()
+  for (k in seq_along(pv)) {
+    lines(lam, mu[, k], type = "b", pch = 16, col = cl[k])
+    ok <- hw[, k] > 1e-8
+    if (any(ok)) suppressWarnings(arrows(lam[ok], mu[ok, k] - hw[ok, k], lam[ok], mu[ok, k] + hw[ok, k], angle = 90, code = 3, length = 0.03, col = cl[k]))
+  }
+  legend("topleft", legend = sprintf("prevalence %.0f%%", 100 * pv), col = cl, pch = 16, lty = 1, bty = "n", cex = 0.8)
+}
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+line_panel("sens_t05", "(a) True sensitivity at threshold 0.5", "sensitivity")
+line_panel("fpr_t05", "(b) True FPR at threshold 0.5", "FPR")
+line_panel("calib_int", "(c) Calibration intercept", "intercept")
+line_panel("sens_tuned", "(d) True sensitivity, tuned threshold (FPR ~ 5%)", "sensitivity", ylim = c(0, 0.35))
+mtext(sprintf("n = 2,000, %d replicates per prevalence (mean +/- 1.96 MC SE)", R), outer = TRUE, line = 0.3, cex = 0.8)
+```
+
+A paired comparison against B (same samples, so Monte Carlo noise cancels) for the tuned-threshold sensitivity:
+
+```{r paired}
+pair <- do.call(rbind, lapply(pv, function(p) {
+  b <- df[df$method == "B" & df$prevalence == p, ]
+  do.call(rbind, lapply(c("A", "C2", "C5", "C10", "C20"), function(m) {
+    x <- df[df$method == m & df$prevalence == p, ]; d <- x$sens_tuned - b$sens_tuned
+    data.frame(Prevalence = sprintf("%.0f%%", 100 * p), Method = m, `Difference from B` = mean(d), `MC SE` = sd(d) / sqrt(length(d)), check.names = FALSE)
+  }))
+}))
+knitr::kable(pair, digits = 4, row.names = FALSE, caption = "Table 7. Sensitivity with a tuned threshold: method minus B (paired)")
+```
+
+# How to read the results
+
+* **Tables 2 and 3 (threshold 0.5)**: look at how sensitivity and FPR both change with $\lambda$ at each prevalence. Is the same $\lambda$ more or less aggressive when the outcome is rarer?
+* **Table 4 (calibration)**: the intercept should fall by roughly $\log\lambda$ from B's value at every prevalence.
+* **Tables 5 and 7 (tuned threshold)**: if sensitivity is nearly the same across $\lambda$, then $\lambda$ adds nothing once the threshold is tuned. Check that the paired differences are small relative to the sensitivity itself.
+* **Table 6**: the FPR actually achieved should be close to the target 0.05. If it is not, the threshold tuning is unstable at that prevalence.
+
+# Caveats
+
+* One scenario, one learner (unpenalized logistic regression), one selection mechanism.
+* Selection depends only on a predictor, so A and B are nearly identical here. A difference between them needs outcome-related selection or misspecification.
+* The design is PPS with replacement, a simplification of real NHANES-type designs.
+* Each sample has only about 60 to 100 positives, so fitted models rank worse than the true probabilities.
+
+# Exercises
+
+1. Add 0.01 to `PREVS`. How many positives per sample, and what happens to the spread of the results?
+2. Change `PER` from 20 to 50 (n = 5,000). Does the variability fall?
+3. Make the outcome depend on `x1^2` in `make_population()` but fit only linear terms (misspecification). Does $\lambda$ now change sensitivity at a fixed FPR?
+4. Make selection depend on the outcome (add a term for `y` to the size measure). Do A and B now differ?
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
