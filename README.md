@@ -2,15 +2,6 @@ Survey-Aware Machine Learning for Rare-Outcome Prediction: NHANES Application
 
 This repository contains the R code and results for the preliminary analysis in my PhD proposal, Survey-Aware Machine Learning for Rare-Outcome Prediction under Complex Sampling Designs.
 
-The question
-
-Health surveys such as NHANES select people with unequal probabilities, in clusters, and many outcomes of interest are rare. Two kinds of weights are used in training a prediction model:
-
-Survey weights say how many people in the population each respondent represents.
-Class weights (λ) make the model pay more attention to the rare outcome.
-
-They do different jobs, so it is not obvious how they should be combined. This analysis asks: does adding a class weight λ to a survey-weighted model improve detection of a rare outcome, compared with simply keeping the survey-weighted model and tuning its classification threshold?
-
 Data and outcome
 Data: NHANES 2015–2016 and 2017–2018 (US National Center for Health Statistics, CDC). The script downloads the public files itself (demographics, body measures, blood pressure, glycohemoglobin, diabetes questionnaire).
 Sample: adults aged 20 and over with an HbA1c measurement and no reported diabetes diagnosis (n = 8,621).
