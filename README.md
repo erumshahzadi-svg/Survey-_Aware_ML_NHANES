@@ -2,12 +2,21 @@ Survey-Aware Machine Learning for Rare-Outcome Prediction: NHANES Application
 
 This repository contains the R code and results for the preliminary analysis in my PhD proposal, Survey-Aware Machine Learning for Rare-Outcome Prediction under Complex Sampling Designs.
 
+The question
+
+Health surveys such as NHANES select people with unequal probabilities, in clusters, and many outcomes of interest are rare. Two kinds of weights are used in training a prediction model:
+
+Survey weights say how many people in the population each respondent represents.
+Class weights (λ) make the model pay more attention to the rare outcome.
+
+They do different jobs, so it is not obvious how they should be combined. This analysis asks: does adding a class weight λ to a survey-weighted model improve detection of a rare outcome, compared with simply keeping the survey-weighted model and tuning its classification threshold?
+
 Data and outcome
 Data: NHANES 2015–2016 and 2017–2018 (US National Center for Health Statistics, CDC). The script downloads the public files itself (demographics, body measures, blood pressure, glycohemoglobin, diabetes questionnaire).
 Sample: adults aged 20 and over with an HbA1c measurement and no reported diabetes diagnosis (n = 8,621).
 Outcome: undiagnosed diabetes, defined as HbA1c ≥ 6.5% with no reported diagnosis (341 cases; weighted prevalence 2.5%).
 Predictors: age, sex, race/ethnicity, BMI, waist circumference, systolic and diastolic blood pressure, income-to-poverty ratio. Missing predictor values are filled with the median.
-Weights: MEC examination weights, divided by 2 because two survey cycles are combined. Kish effective sample size is about 4,173.
+Weights: the two-year MEC examination weight (WTMEC2YR) divided by 2 to give a combined four-year weight, following NHANES guidance. Strata and PSU variables (SDMVSTRA, SDMVPSU) are kept for PSU-grouped folds and the PSU bootstrap. The weight-based Kish effective sample size is about 4,173; it reflects weight variability only, not the full effect of clustering and stratification.
 Methods compared
 Label	Model
 B	Survey-weighted logistic regression (λ = 1)
@@ -29,7 +38,7 @@ AUROC was about 0.79 for all models. With the tuned threshold, the false-positiv
 Reading the table
 
 At a fixed threshold (0.5), a larger λ raises sensitivity, but only because it also raises the false-positive rate. The model's ranking of people has not improved; its operating point has moved.
-Calibration: the intercept falls by 2.82 between B and λ = 20, close to log(20) = 3.00. This matches a simple analytic result: in a correctly specified logistic model, class weighting shifts the intercept by log(λ) and leaves the slopes unchanged. The calibration slope also worsens, so class-weighted probabilities need recalibration before they are used as risks.
+Calibration: the calibration intercept (from regressing the observed outcome on the logit of the predicted probability) falls by 2.82 between B and λ = 20, close to −log(20) = −3.00. This matches a simple analytic result: in a correctly specified logistic model, class weighting leaves the slopes unchanged and shifts the model's fitted intercept by log(λ), which inflates the predicted probabilities. The calibration intercept is a different quantity: it measures the agreement between predicted and observed outcomes, and it reflects the fitted-intercept shift indirectly. The calibration slope also worsens, so class-weighted probabilities need recalibration before they are used as risks.
 With the threshold tuned to the same false-positive rate, sensitivity is essentially the same for all λ (0.225–0.231). The average difference between λ = 20 and B is +0.002 (95% PSU-bootstrap interval −0.008 to 0.012), which is indistinguishable from zero.
 
 Conclusion. In this setting, class weighting adds nothing beyond a survey-weighted model with a tuned threshold. The research question for the PhD is where this equivalence breaks (model misspecification, penalized or flexible learners, very few positive cases, outcome-related selection).
@@ -56,6 +65,12 @@ A linear logistic model and simple median imputation.
 NHANES has no known truth, so performance is estimated by design-weighted cross-validation. The simulation, where the whole population is known, provides the exact comparison.
 This is preliminary work to support a research proposal, not a finished study, and it is not clinical guidance.
 Data source
+
+National Center for Health Statistics. National Health and Nutrition Examination Survey (NHANES). Centers for Disease Control and Prevention. https://www.cdc.gov/nhanes/
+
+Author
+
+Erum Shahzadi, Department of Statistics, University of Gujrat, Pakistan.
 
 National Center for Health Statistics. National Health and Nutrition Examination Survey (NHANES). Centers for Disease Control and Prevention. https://www.cdc.gov/nhanes/
 
